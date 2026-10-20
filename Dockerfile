@@ -19,5 +19,7 @@ USER 101
 
 EXPOSE 8080
 
+# Exec form (no "sh -c"): a shell spawned as the nginx user trips the Falco rule
+# "Shell Spawned by Web User" on the EC2 host and gets the instance quarantined.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -q -O /dev/null http://127.0.0.1:8080/health || exit 1
+  CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
