@@ -24,6 +24,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Fail fast instead of hanging for hours if a test process never exits.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4

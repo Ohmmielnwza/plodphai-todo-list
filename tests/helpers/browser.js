@@ -69,7 +69,8 @@ function findBrowser() {
 function waitForDevtoolsUrl(proc) {
   return new Promise((resolve, reject) => {
     let buf = '';
-    const timer = setTimeout(() => reject(new Error('Browser did not start in time')), 20000);
+    // Cold starts on shared CI runners can take well over 20s.
+    const timer = setTimeout(() => reject(new Error('Browser did not start in time')), 60000);
     proc.stderr.on('data', (chunk) => {
       buf += chunk.toString();
       const m = buf.match(/DevTools listening on (ws:\/\/[^\s]+)/);
@@ -156,7 +157,7 @@ async function launchBrowser() {
   const executable = findBrowser();
   if (!executable) throw new Error('No Chromium-based browser found (set CHROME_PATH).');
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'plodphai-e2e-'));
-  const proc = spawn(executable, [
+  const args = [
     '--headless=new',
     '--remote-debugging-port=0',
     '--user-data-dir=' + profile,
@@ -164,22 +165,36 @@ async function launchBrowser() {
     '--no-default-browser-check',
     '--disable-gpu',
     '--disable-extensions',
-    '--window-size=1280,900',
-    'about:blank'
-  ], { stdio: ['ignore', 'ignore', 'pipe'] });
+    '--disable-dev-shm-usage',
+    '--window-size=1280,900'
+  ];
+  // GitHub's Ubuntu runners restrict the user namespaces Chrome's sandbox needs.
+  if (process.env.CI) args.push('--no-sandbox');
+  args.push('about:blank');
+  const proc = spawn(executable, args, { stdio: ['ignore', 'ignore', 'pipe'] });
 
-  const browserWs = await waitForDevtoolsUrl(proc);
-  const port = new URL(browserWs).port;
-  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-  const target = targets.find((t) => t.type === 'page');
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve, { once: true });
-    ws.addEventListener('error', reject, { once: true });
-  });
-  const page = new Page(ws);
-  await page.send('Page.enable');
-  await page.send('Runtime.enable');
+  let ws;
+  let page;
+  try {
+    const browserWs = await waitForDevtoolsUrl(proc);
+    const port = new URL(browserWs).port;
+    const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    const target = targets.find((t) => t.type === 'page');
+    ws = new WebSocket(target.webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      ws.addEventListener('open', resolve, { once: true });
+      ws.addEventListener('error', reject, { once: true });
+    });
+    page = new Page(ws);
+    await page.send('Page.enable');
+    await page.send('Runtime.enable');
+  } catch (err) {
+    // Without this the orphaned browser keeps the test process alive forever.
+    try { if (ws) ws.close(); } catch (e) { /* ignore */ }
+    proc.kill('SIGKILL');
+    try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3 }); } catch (e) { /* ignore */ }
+    throw err;
+  }
 
   async function close() {
     try { ws.close(); } catch (e) { /* ignore */ }
