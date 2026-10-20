@@ -1,0 +1,19 @@
+# Node
+node_modules/
+coverage/
+
+# Pipeline outputs
+sbom*.json
+trivy-*.json
+
+# Local configuration / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

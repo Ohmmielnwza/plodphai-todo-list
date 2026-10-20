@@ -1,0 +1,149 @@
+name: CI
+
+# Single-app repository: every push is about this app, so no path filters.
+# Image goes to ECR repository "plodphai-todo-list".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No npm cache / npm ci: this app has zero dependencies and no
+      # package-lock.json, so setup-node's cache step would fail to resolve.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run tests
+        run: npm test
+
+  security:
+    name: Security checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Semgrep (JavaScript, Dockerfile, secrets)
+        run: |
+          # No --strict here: semgrep's Dockerfile parser cannot read the
+          # multi-line LABEL / HEALTHCHECK in this Dockerfile (docker build
+          # accepts them fine), and --strict would turn that parser warning
+          # into a failed job. --error still fails on any real finding.
+          semgrep scan --error \
+            --config p/javascript --config p/dockerfile --config p/secrets .
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          format: table
+
+  build-and-push:
+    name: Build and push
+    needs: [test, security]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t "$REGISTRY/plodphai-todo-list:$TAG" \
+            -t "$REGISTRY/plodphai-todo-list:latest" \
+            .
+
+      - name: Smoke test container
+        env:
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/plodphai-todo-list:${{ github.sha }}
+        run: |
+          docker run -d --name smoke -p 8080:8080 "$IMAGE"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health; then echo; break; fi
+            sleep 1
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:8080/
+          docker rm -f smoke
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/plodphai-todo-list:${{ github.sha }}
+          scan-type: image
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/plodphai-todo-list:${{ github.sha }}
+          scan-type: image
+          format: cyclonedx
+          output: sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json
+
+      - name: Push image to ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker push "$REGISTRY/plodphai-todo-list:$TAG"
+          docker push "$REGISTRY/plodphai-todo-list:latest"
