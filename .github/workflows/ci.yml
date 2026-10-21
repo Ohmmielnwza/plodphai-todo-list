@@ -9,12 +9,18 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Also run terraform apply (prodpai_cloud) and update the dashboard"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# Manual runs get their own group so a later push never cancels a deploy half-way through.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -149,3 +155,125 @@ jobs:
         run: |
           docker push "$REGISTRY/plodphai-todo-list:$TAG"
           docker push "$REGISTRY/plodphai-todo-list:latest"
+
+  # Manual only (Run workflow > deploy = true): builds the infrastructure from
+  # prodpai_cloud with this commit's image, then updates and feeds the dashboard EC2.
+  deploy:
+    name: Deploy infrastructure and dashboard
+    needs: [build-and-push]
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: prodpai-terraform
+      cancel-in-progress: false
+    env:
+      INFRA_REPO: nuntawatrdd/prodpai_cloud
+      INFRA_REF: apps
+      DASHBOARD_NAME: prodpai-dashboard
+    steps:
+      - name: Checkout prodpai_cloud
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          ref: ${{ env.INFRA_REF }}
+          path: infra
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          # raw stdout, so `terraform output -json` can be piped to curl
+          terraform_wrapper: false
+
+      - name: Terraform apply
+        working-directory: infra
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false -var="image_tag=${{ github.sha }}"
+
+      - name: Start dashboard instance
+        id: dash
+        run: |
+          iid=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$DASHBOARD_NAME" Name=instance-state-name,Values=pending,running,stopping,stopped \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          if [ "$iid" = "None" ]; then
+            echo "::error::No EC2 instance tagged Name=$DASHBOARD_NAME (see dashboard-ec2/README-dashboard-ec2.md)"
+            exit 1
+          fi
+          aws ec2 start-instances --instance-ids "$iid" >/dev/null 2>&1 || true
+          aws ec2 wait instance-running --instance-ids "$iid"
+          # SSM needs an instance profile; attach the lab one if the instance was launched without it
+          profile=$(aws ec2 describe-instances --instance-ids "$iid" \
+            --query 'Reservations[0].Instances[0].IamInstanceProfile.Arn' --output text)
+          if [ "$profile" = "None" ]; then
+            aws ec2 associate-iam-instance-profile --instance-id "$iid" --iam-instance-profile Name=LabInstanceProfile >/dev/null
+          fi
+          for i in $(seq 1 40); do
+            online=$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$iid" \
+              --query 'InstanceInformationList[0].PingStatus' --output text)
+            [ "$online" = "Online" ] && break
+            sleep 15
+          done
+          if [ "$online" != "Online" ]; then
+            echo "::error::$iid is not reachable through SSM"
+            exit 1
+          fi
+          echo "id=$iid" >> "$GITHUB_OUTPUT"
+          echo "ip=$(aws ec2 describe-instances --instance-ids "$iid" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Update dashboard code
+        env:
+          IID: ${{ steps.dash.outputs.id }}
+        run: |
+          # Pull the dashboard from prodpai_cloud into /opt/prodpai and point the service at it.
+          cat > update.sh <<EOF
+          set -e
+          if [ -d /opt/prodpai/.git ]; then
+            git -C /opt/prodpai fetch --depth 1 origin $INFRA_REF
+            git -C /opt/prodpai reset --hard FETCH_HEAD
+          else
+            git clone --depth 1 -b $INFRA_REF https://github.com/$INFRA_REPO.git /opt/prodpai
+          fi
+          chown -R ubuntu:ubuntu /opt/prodpai/dashboard
+          [ -x /opt/venv/bin/pip ] || python3 -m venv /opt/venv
+          /opt/venv/bin/pip install -q -r /opt/prodpai/dashboard/requirements.txt
+          sed -i -e 's#^WorkingDirectory=.*#WorkingDirectory=/opt/prodpai/dashboard#' \
+                 -e 's#^ExecStart=.*#ExecStart=/opt/venv/bin/gunicorn dashboard_app:app#' \
+                 /etc/systemd/system/prodpai-dashboard.service
+          systemctl daemon-reload
+          systemctl restart prodpai-dashboard
+          git -C /opt/prodpai log -1 --format='dashboard at %h %s'
+          EOF
+          python3 -c 'import json; print(json.dumps({"commands": open("update.sh").read().splitlines()}))' > params.json
+          cmd=$(aws ssm send-command --instance-ids "$IID" --document-name AWS-RunShellScript \
+            --parameters file://params.json --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$cmd" --instance-id "$IID" || true
+          aws ssm get-command-invocation --command-id "$cmd" --instance-id "$IID" \
+            --query '[Status, StandardOutputContent, StandardErrorContent]' --output text
+          status=$(aws ssm get-command-invocation --command-id "$cmd" --instance-id "$IID" --query Status --output text)
+          [ "$status" = "Success" ]
+
+      - name: Send Terraform output to dashboard
+        working-directory: infra
+        env:
+          IP: ${{ steps.dash.outputs.ip }}
+          TOKEN: ${{ secrets.DASHBOARD_TOKEN }}
+        run: |
+          for i in $(seq 1 30); do curl -sf -o /dev/null "http://$IP/api/data" && break; sleep 5; done
+          terraform output -json infrastructure_summary \
+            | curl -sf --retry 3 -X POST -H "Content-Type: application/json" -H "X-Update-Token: $TOKEN" \
+                   --data-binary @- "http://$IP/api/update"
+          echo
+          echo "Dashboard: http://$IP/"
+          echo "Application: $(terraform output -raw lb_domain_name_http)"
