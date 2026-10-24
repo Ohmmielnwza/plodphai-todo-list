@@ -18,7 +18,7 @@ on:
 permissions:
   contents: read
 
-# Same group as the deploy job in ci.yml, so apply and destroy never run at the same time.
+# Same group as deploy.yml, so apply and destroy never run at the same time.
 concurrency:
   group: prodpai-terraform
   cancel-in-progress: false

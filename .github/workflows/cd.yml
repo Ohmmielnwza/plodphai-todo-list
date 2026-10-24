@@ -1,0 +1,70 @@
+name: CD
+
+# Runs after a successful CI run on main and pushes the image CI built and
+# scanned to the ECR repository set in .github/config.env (tags: commit SHA and latest).
+# Nothing else: infrastructure is deployed manually with deploy.yml.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  # download the image artifact from the CI run
+  actions: read
+
+# Pushes run one at a time and in order, so "latest" always ends on the newest commit.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  push:
+    name: Push image to ECR
+    # Pull requests from main-based forks also trigger workflow_run; only push real main builds.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      # github.sha here is the default branch head, not necessarily the commit CI built.
+      TAG: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Download image from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Load image and config
+        run: |
+          gunzip -c image.tar.gz | docker load
+          grep -E '^[A-Z_]+=' config.env | tr -d '\r' >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag "$ECR_REPOSITORY:$TAG" "$REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker tag "$ECR_REPOSITORY:$TAG" "$REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "Pushed $REGISTRY/$ECR_REPOSITORY:$TAG" >> "$GITHUB_STEP_SUMMARY"
