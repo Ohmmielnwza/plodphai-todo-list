@@ -1,8 +1,10 @@
 name: CI
 
 # Single-app repository: every push is about this app, so no path filters.
-# CI only tests, scans and builds the image; it never touches AWS.
-# On main, the built image is handed to the CD workflow (cd.yml), which pushes it to ECR.
+# CI tests, scans and builds the image, then pushes it to the ECR repository
+# set in .github/config.env (tags: commit SHA and latest) on main.
+# It never touches infrastructure: the Deploy / Destroy workflows live in
+# prodpai_cloud and are run by the AWS account owner.
 
 on:
   push:
@@ -17,6 +19,9 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
 
 jobs:
   test:
@@ -73,7 +78,7 @@ jobs:
           format: table
 
   build:
-    name: Build and scan image
+    name: Build, scan and push image
     needs: [test, security]
     runs-on: ubuntu-latest
     steps:
@@ -123,20 +128,32 @@ jobs:
           name: sbom-${{ github.sha }}
           path: sbom.json
 
-      # CD pushes exactly this tested image instead of rebuilding it. CD does not
-      # check out the repo, so the config goes along (upload-artifact skips hidden paths).
-      - name: Save image
+      # Everything below only runs for real main builds: a pull request is
+      # tested and scanned, but nothing from it reaches the registry.
+      - name: Configure AWS credentials
         if: github.event_name != 'pull_request'
-        run: |
-          docker save "$ECR_REPOSITORY:${{ github.sha }}" | gzip > image.tar.gz
-          cp .github/config.env config.env
-
-      - name: Upload image
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          name: image
-          path: |
-            image.tar.gz
-            config.env
-          retention-days: 1
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The exact image that was just tested and scanned, never a rebuild.
+      - name: Push image to ECR
+        if: github.event_name != 'pull_request'
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker tag "$ECR_REPOSITORY:$TAG" "$REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker tag "$ECR_REPOSITORY:$TAG" "$REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "Pushed \`$REGISTRY/$ECR_REPOSITORY:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy it from the Deploy workflow in prodpai_cloud." >> "$GITHUB_STEP_SUMMARY"
