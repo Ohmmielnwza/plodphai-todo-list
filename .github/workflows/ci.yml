@@ -1,10 +1,14 @@
 name: CI
 
 # Single-app repository: every push is about this app, so no path filters.
-# CI tests, scans and builds the image, then pushes it to the ECR repository
-# set in .github/config.env (tags: commit SHA and latest) on main.
-# It never touches infrastructure: Infra Setup / Launch Image / Destroy live in
-# prodpai_cloud and are run by the AWS account owner.
+# CI tests, scans and builds the image, pushes it to the ECR repository set in
+# .github/config.env (tags: commit SHA and latest), then rolls it into the running
+# EC2 instances — all on main only.
+#
+# การ rollout ที่นี่แตะแค่ "เครื่องรันอะไรอยู่" เท่านั้น ไม่ได้แตะรูปร่างของ infrastructure:
+# มันสร้าง launch template version ใหม่แล้วติด tag ให้ ASG ทยอยเปลี่ยนเครื่องเอง
+# ไม่มีการลบหรือสร้าง resource ใดๆ การวาง topology ทั้งชุดยังเป็นของ Infra Setup
+# ที่ repo prodpai_cloud และ Launch Image ที่นั่นยังใช้ย้อน tag เก่าได้อยู่
 
 on:
   push:
@@ -214,9 +218,138 @@ jobs:
             echo ""
             echo "- \`$REGISTRY/$ECR_REPOSITORY:$TAG\`"
             echo "- \`$REGISTRY/$ECR_REPOSITORY:latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rollout:
+    name: Roll the new image into the ASG
+    needs: [build]
+    # เฉพาะของจริงบน main เท่านั้น PR หรือการกด Run workflow จาก branch อื่นไม่แตะ production
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # กันตัวเองซ้อนกันเอง ถ้า push ติดๆ กันหลายรอบ ให้รอรอบก่อนหน้าจบก่อน
+    concurrency:
+      group: prodpai-rollout
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ชื่อ ECR มาจากไฟล์เดียวกับที่ job build ใช้ จะได้ไม่มีโอกาสเขียนคนละชื่อกัน
+      - name: Load shared config
+        run: grep -E '^[A-Z_]+=' .github/config.env | tr -d '\r' >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find the ASG and its launch template
+        id: find
+        run: |
+          asg=$(aws autoscaling describe-auto-scaling-groups \
+            --query "AutoScalingGroups[?starts_with(AutoScalingGroupName, 'prod-pai-env-asg')].AutoScalingGroupName | [0]" \
+            --output text)
+          if [ "$asg" = "None" ] || [ -z "$asg" ]; then
+            echo "::error::ยังไม่มี ASG — ต้องรัน Infra Setup ที่ repo prodpai_cloud ก่อนหนึ่งครั้ง"
+            exit 1
+          fi
+          lt=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" \
+            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' --output text)
+          echo "asg=$asg" >> "$GITHUB_OUTPUT"
+          echo "lt=$lt" >> "$GITHUB_OUTPUT"
+
+      # ยิงรอบใหม่ทับรอบที่ยังไม่จบจะโดนปฏิเสธ แล้วเครื่องจะค้างคาอยู่ครึ่งทาง
+      # push ติดๆ กันเป็นเรื่องปกติ จึงรอให้รอบก่อนจบแทนที่จะ fail ทิ้ง
+      - name: Wait for any running refresh to finish
+        run: |
+          for i in $(seq 1 40); do
+            status=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "${{ steps.find.outputs.asg }}" \
+              --query 'InstanceRefreshes[0].Status' --output text)
+            case "$status" in
+              Pending|InProgress|Cancelling) echo "  รอรอบก่อนหน้า ($status)"; sleep 30 ;;
+              *) echo "ว่างแล้ว (ล่าสุด: $status)"; exit 0 ;;
+            esac
+          done
+          echo "::error::รอรอบก่อนหน้าไม่จบภายในเวลา"
+          exit 1
+
+      # เอา user data ของ version ล่าสุดจาก AWS มาแก้เฉพาะ tag ของ image
+      # ไม่ประกอบขึ้นใหม่จากไฟล์ใน repo เพราะ repo นี้ไม่ได้ถือ userdata.sh
+      # และวิธีนี้รักษาค่าอื่นที่ฝั่ง infra แก้ไว้เอาไว้ครบ
+      - name: Create a launch template version pointing at the new image
+        id: ltv
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          image="$account.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY"
+
+          aws ec2 describe-launch-template-versions \
+            --launch-template-id "${{ steps.find.outputs.lt }}" --versions '$Latest' \
+            --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text \
+            | base64 -d > /tmp/userdata.sh
+
+          if ! grep -q "$image:" /tmp/userdata.sh; then
+            echo "::error::ไม่พบ $image ใน user data ของ launch template — ตรวจชื่อ ECR ให้ตรงกับ ec2.tf"
+            exit 1
+          fi
+          sed -i -E "s#($image):[A-Za-z0-9._-]+#\1:$TAG#g" /tmp/userdata.sh
+          base64 -w0 /tmp/userdata.sh > /tmp/userdata.b64
+
+          version=$(aws ec2 create-launch-template-version \
+            --launch-template-id "${{ steps.find.outputs.lt }}" \
+            --source-version '$Latest' \
+            --version-description "image $TAG" \
+            --launch-template-data "{\"UserData\":\"$(cat /tmp/userdata.b64)\"}" \
+            --query 'LaunchTemplateVersion.VersionNumber' --output text)
+
+          aws ec2 modify-launch-template \
+            --launch-template-id "${{ steps.find.outputs.lt }}" \
+            --default-version "$version" >/dev/null
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # ASG ตั้ง instance_refresh triggers = ["tag"] ไว้ การเขียน tag ใหม่จึงเป็นสัญญาณ
+      # ให้มันทยอยเปลี่ยนเครื่องเอง (Rolling, min healthy 50%, warmup 180 วินาที)
+      # ไม่มีการลบเครื่องแล้วสร้างใหม่ทั้งชุด
+      - name: Trigger the rolling refresh
+        run: |
+          aws autoscaling create-or-update-tags --tags \
+            "ResourceId=${{ steps.find.outputs.asg }},ResourceType=auto-scaling-group,Key=ImageTag,Value=$TAG,PropagateAtLaunch=true"
+
+      - name: Wait for the rollout
+        run: |
+          asg="${{ steps.find.outputs.asg }}"
+          sleep 20
+          for i in $(seq 1 60); do
+            info=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" \
+                     --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text)
+            status=$(echo "$info" | awk '{print $1}')
+            pct=$(echo "$info" | awk '{print $2}')
+            echo "  $status ${pct}%"
+            case "$status" in
+              Successful) echo "เครื่องทุกตัวเปลี่ยนเป็น image ใหม่แล้ว"; exit 0 ;;
+              Failed|Cancelled) echo "::error::instance refresh $status"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "::warning::รอครบเวลาแล้วยังไม่จบ ไปดูต่อที่ ASG → Instance refresh"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Rollout"
             echo ""
-            echo "**ขั้นต่อไป (คนกดเอง ไม่ได้ผูกอัตโนมัติ):** ที่ repo \`prodpai_cloud\`"
-            echo "→ Actions → **Launch Image** → ใส่ \`image_tag\` = \`$TAG\`"
+            echo "- ASG: \`${{ steps.find.outputs.asg }}\`"
+            echo "- Launch template version: \`${{ steps.ltv.outputs.version }}\`"
+            echo "- Image: \`$ECR_REPOSITORY:$TAG\`"
             echo ""
-            echo "ถ้ายังไม่เคยวาง infrastructure มาก่อน ให้รัน **Infra Setup** ที่ repo นั้นก่อนหนึ่งครั้ง"
+            echo "ASG ทยอยเปลี่ยนเครื่องเองแบบ rolling (min healthy 50%, warmup 180s)"
+            echo "ถ้าต้องย้อนกลับ ให้รัน **Launch Image** ที่ repo \`prodpai_cloud\` ด้วย tag เก่า"
           } >> "$GITHUB_STEP_SUMMARY"
