@@ -8,8 +8,9 @@ name: CI
 # การ rollout ที่นี่แตะแค่ "เครื่องรันอะไรอยู่" เท่านั้น ไม่ได้แตะรูปร่างของ infrastructure
 # และไม่ได้แตะ launch template ด้วย มันทำแค่ 2 อย่าง:
 #   1. เปลี่ยนค่า image tag ใน SSM Parameter Store
-#   2. สั่ง start-instance-refresh ให้ ASG ทยอยสลับเครื่อง
+#   2. ทยอยเปลี่ยนเครื่องใน ASG ด้วย .github/scripts/rollout.sh (เปิดใหม่ก่อน ปิดเก่าทีหลัง)
 # เครื่องใหม่บูตขึ้นมาอ่าน tag จาก SSM แล้ว docker pull ตัวนั้นมารัน
+# (ไม่ใช้ start-instance-refresh เพราะบัญชี AWS Academy มี SCP deny คำสั่งนั้นไว้)
 #
 # ไม่มีการลบหรือสร้าง resource ใดๆ การวาง topology ทั้งชุดยังเป็นของ Infra Setup
 # ที่ repo prodpai_cloud และ Launch Image ที่นั่นใช้ย้อน tag เก่าได้ด้วยกลไกเดียวกัน
@@ -240,6 +241,10 @@ jobs:
       # ป้ายประกาศที่เครื่องใน ASG อ่านตอนบูต สร้างโดย Terraform ฝั่ง infra (ssm.tf)
       IMAGE_TAG_PARAM: /prod-pai/app/image_tag
     steps:
+      # checkout มาเพื่อใช้ .github/scripts/rollout.sh
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -260,20 +265,24 @@ jobs:
           fi
           echo "asg=$asg" >> "$GITHUB_OUTPUT"
 
-      # ยิงรอบใหม่ทับรอบที่ยังไม่จบจะโดนปฏิเสธ แล้วเครื่องจะค้างคาอยู่ครึ่งทาง
-      # push ติดๆ กันเป็นเรื่องปกติ จึงรอให้รอบก่อนจบแทนที่จะ fail ทิ้ง
-      - name: Wait for any running refresh to finish
+      # ถ้า ASG ยังเปิด/ปิดเครื่องค้างอยู่ (rollout รอบก่อน, scaling, เปลี่ยนเครื่องที่ป่วย)
+      # รอให้นิ่งก่อน ไม่งั้นการนับเครื่องเก่า/ใหม่ใน rollout.sh จะคลาดเคลื่อน
+      - name: Wait for the ASG to settle
         run: |
+          asg="${{ steps.find.outputs.asg }}"
           for i in $(seq 1 40); do
-            status=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name "${{ steps.find.outputs.asg }}" \
-              --query 'InstanceRefreshes[0].Status' --output text)
-            case "$status" in
-              Pending|InProgress|Cancelling) echo "  รอรอบก่อนหน้า ($status)"; sleep 30 ;;
-              *) echo "ว่างแล้ว (ล่าสุด: $status)"; exit 0 ;;
-            esac
+            read -r desired inservice total <<<"$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$asg" \
+              --query 'AutoScalingGroups[0].[DesiredCapacity,length(Instances[?LifecycleState==`InService`]),length(Instances)]' \
+              --output text)"
+            if [ "$inservice" = "$desired" ] && [ "$total" = "$desired" ]; then
+              echo "นิ่งแล้ว: $inservice/$desired InService"
+              exit 0
+            fi
+            echo "  รอ ASG นิ่ง ($inservice InService, $total ทั้งหมด, desired $desired)"
+            sleep 30
           done
-          echo "::error::รอรอบก่อนหน้าไม่จบภายในเวลา"
+          echo "::error::ASG ไม่นิ่งภายในเวลา"
           exit 1
 
       # 1. เปลี่ยนป้ายประกาศให้เป็นเวอร์ชันที่เพิ่ง push ขึ้น ECR
@@ -286,33 +295,10 @@ jobs:
             --overwrite >/dev/null
           echo "✅ $IMAGE_TAG_PARAM = $TAG"
 
-      # 2. สะกิด ASG ให้ทยอยสลับเครื่อง เครื่องใหม่บูตมาอ่าน tag จาก SSM แล้ว pull ตัวนั้น
-      #    ไม่แตะ launch template และไม่มีคำสั่งลบหรือสร้างเครื่องในนี้เลย
-      - name: Trigger the rolling instance refresh
-        run: |
-          id=$(aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "${{ steps.find.outputs.asg }}" \
-            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":180}' \
-            --query InstanceRefreshId --output text)
-          echo "✅ instance refresh $id เริ่มแล้ว"
-
-      - name: Wait for the rollout
-        run: |
-          asg="${{ steps.find.outputs.asg }}"
-          sleep 20
-          for i in $(seq 1 60); do
-            info=$(aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$asg" \
-                     --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text)
-            status=$(echo "$info" | awk '{print $1}')
-            pct=$(echo "$info" | awk '{print $2}')
-            echo "  $status ${pct}%"
-            case "$status" in
-              Successful) echo "เครื่องทุกตัวรัน image ใหม่แล้ว"; exit 0 ;;
-              Failed|Cancelled) echo "::error::instance refresh $status"; exit 1 ;;
-            esac
-            sleep 30
-          done
-          echo "::warning::รอครบเวลาแล้วยังไม่จบ ไปดูต่อที่ ASG → Instance refresh"
+      # 2. ทยอยเปลี่ยนเครื่อง: เปิดเครื่องใหม่ (อ่าน tag ใหม่จาก SSM) ให้ healthy ก่อน
+      #    แล้วค่อยปิดเครื่องเก่าทีละตัว ถ้าเครื่องใหม่ไม่ healthy จะหยุดโดยไม่แตะเครื่องเก่า
+      - name: Roll the instances
+        run: bash .github/scripts/rollout.sh "${{ steps.find.outputs.asg }}"
 
       - name: Summary
         if: always()
@@ -323,7 +309,7 @@ jobs:
             echo "- ASG: \`${{ steps.find.outputs.asg }}\`"
             echo "- SSM: \`$IMAGE_TAG_PARAM\` = \`$TAG\`"
             echo ""
-            echo "ASG ทยอยสลับเครื่องเองแบบ rolling (min healthy 50%, warmup 180s)"
+            echo "เปิดเครื่องใหม่ก่อนแล้วปิดเครื่องเก่าทีละตัว (.github/scripts/rollout.sh)"
             echo "เครื่องใหม่อ่าน tag จาก SSM ตอนบูตแล้ว docker pull ตัวนั้นมารัน"
             echo "ถ้าต้องย้อนกลับ ให้รัน **Launch Image** ที่ repo \`prodpai_cloud\` ด้วย tag เก่า"
           } >> "$GITHUB_STEP_SUMMARY"
