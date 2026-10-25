@@ -3,7 +3,7 @@ name: CI
 # Single-app repository: every push is about this app, so no path filters.
 # CI tests, scans and builds the image, then pushes it to the ECR repository
 # set in .github/config.env (tags: commit SHA and latest) on main.
-# It never touches infrastructure: the Deploy / Destroy workflows live in
+# It never touches infrastructure: Infra Setup / Launch Image / Destroy live in
 # prodpai_cloud and are run by the AWS account owner.
 
 on:
@@ -15,6 +15,8 @@ on:
 
 permissions:
   contents: read
+  # ให้ผลสแกนขึ้นแท็บ Security ของ repo แทนที่จะจมอยู่ใน log ของ job
+  security-events: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -43,12 +45,37 @@ jobs:
       - name: Run tests
         run: npm test
 
+  lint:
+    name: Dockerfile lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Trivy misconfig จับเรื่อง security ของ Dockerfile แต่ไม่จับเรื่องคุณภาพ
+      # เช่น ไม่ปักเวอร์ชัน apt หรือเรียง layer ผิดจน cache ไม่ทำงาน
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
   security:
     name: Security checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # gitleaks ต้องอ่านทุก commit ไม่ใช่แค่ไฟล์ปัจจุบัน
+          fetch-depth: 0
+
+      # Trivy secret สแกนแค่ working tree ความลับที่เคย commit แล้วลบออกทีหลังจะไม่เจอ
+      # แต่มันยังอยู่ใน history และยังใช้งานได้อยู่ ถ้าไม่ได้เพิกถอน
+      - name: Gitleaks (full history)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.21.2 \
+            detect --source=/repo --redact --no-banner --exit-code 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -64,8 +91,17 @@ jobs:
           # multi-line LABEL / HEALTHCHECK in this Dockerfile (docker build
           # accepts them fine), and --strict would turn that parser warning
           # into a failed job. --error still fails on any real finding.
-          semgrep scan --error \
+          semgrep scan --error --sarif --output semgrep.sarif \
             --config p/javascript --config p/dockerfile --config p/secrets .
+
+      # ผลจะขึ้นแท็บ Security ถ้า repo เปิด code scanning ไว้ ถ้ายังไม่เปิดก็ไม่ทำให้ job ตก
+      - name: Upload Semgrep results
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
 
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
@@ -77,9 +113,27 @@ jobs:
           exit-code: "1"
           format: table
 
+      - name: Trivy filesystem scan (SARIF)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          format: sarif
+          output: trivy-fs.sarif
+
+      - name: Upload Trivy results
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
   build:
     name: Build, scan and push image
-    needs: [test, security]
+    needs: [test, lint, security]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -155,5 +209,14 @@ jobs:
           docker tag "$ECR_REPOSITORY:$TAG" "$REGISTRY/$ECR_REPOSITORY:latest"
           docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
           docker push "$REGISTRY/$ECR_REPOSITORY:latest"
-          echo "Pushed \`$REGISTRY/$ECR_REPOSITORY:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Deploy it from the Deploy workflow in prodpai_cloud." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Image pushed"
+            echo ""
+            echo "- \`$REGISTRY/$ECR_REPOSITORY:$TAG\`"
+            echo "- \`$REGISTRY/$ECR_REPOSITORY:latest\`"
+            echo ""
+            echo "**ขั้นต่อไป (คนกดเอง ไม่ได้ผูกอัตโนมัติ):** ที่ repo \`prodpai_cloud\`"
+            echo "→ Actions → **Launch Image** → ใส่ \`image_tag\` = \`$TAG\`"
+            echo ""
+            echo "ถ้ายังไม่เคยวาง infrastructure มาก่อน ให้รัน **Infra Setup** ที่ repo นั้นก่อนหนึ่งครั้ง"
+          } >> "$GITHUB_STEP_SUMMARY"
