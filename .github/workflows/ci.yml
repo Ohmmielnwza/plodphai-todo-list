@@ -5,10 +5,14 @@ name: CI
 # .github/config.env (tags: commit SHA and latest), then rolls it into the running
 # EC2 instances — all on main only.
 #
-# การ rollout ที่นี่แตะแค่ "เครื่องรันอะไรอยู่" เท่านั้น ไม่ได้แตะรูปร่างของ infrastructure:
-# มันสร้าง launch template version ใหม่แล้วติด tag ให้ ASG ทยอยเปลี่ยนเครื่องเอง
+# การ rollout ที่นี่แตะแค่ "เครื่องรันอะไรอยู่" เท่านั้น ไม่ได้แตะรูปร่างของ infrastructure
+# และไม่ได้แตะ launch template ด้วย มันทำแค่ 2 อย่าง:
+#   1. เปลี่ยนค่า image tag ใน SSM Parameter Store
+#   2. สั่ง start-instance-refresh ให้ ASG ทยอยสลับเครื่อง
+# เครื่องใหม่บูตขึ้นมาอ่าน tag จาก SSM แล้ว docker pull ตัวนั้นมารัน
+#
 # ไม่มีการลบหรือสร้าง resource ใดๆ การวาง topology ทั้งชุดยังเป็นของ Infra Setup
-# ที่ repo prodpai_cloud และ Launch Image ที่นั่นยังใช้ย้อน tag เก่าได้อยู่
+# ที่ repo prodpai_cloud และ Launch Image ที่นั่นใช้ย้อน tag เก่าได้ด้วยกลไกเดียวกัน
 
 on:
   push:
@@ -233,14 +237,9 @@ jobs:
       cancel-in-progress: false
     env:
       TAG: ${{ github.sha }}
+      # ป้ายประกาศที่เครื่องใน ASG อ่านตอนบูต สร้างโดย Terraform ฝั่ง infra (ssm.tf)
+      IMAGE_TAG_PARAM: /prod-pai/app/image_tag
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ชื่อ ECR มาจากไฟล์เดียวกับที่ job build ใช้ จะได้ไม่มีโอกาสเขียนคนละชื่อกัน
-      - name: Load shared config
-        run: grep -E '^[A-Z_]+=' .github/config.env | tr -d '\r' >> "$GITHUB_ENV"
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -249,7 +248,7 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Find the ASG and its launch template
+      - name: Find the ASG
         id: find
         run: |
           asg=$(aws autoscaling describe-auto-scaling-groups \
@@ -259,10 +258,7 @@ jobs:
             echo "::error::ยังไม่มี ASG — ต้องรัน Infra Setup ที่ repo prodpai_cloud ก่อนหนึ่งครั้ง"
             exit 1
           fi
-          lt=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" \
-            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' --output text)
           echo "asg=$asg" >> "$GITHUB_OUTPUT"
-          echo "lt=$lt" >> "$GITHUB_OUTPUT"
 
       # ยิงรอบใหม่ทับรอบที่ยังไม่จบจะโดนปฏิเสธ แล้วเครื่องจะค้างคาอยู่ครึ่งทาง
       # push ติดๆ กันเป็นเรื่องปกติ จึงรอให้รอบก่อนจบแทนที่จะ fail ทิ้ง
@@ -280,47 +276,25 @@ jobs:
           echo "::error::รอรอบก่อนหน้าไม่จบภายในเวลา"
           exit 1
 
-      # เอา user data ของ version ล่าสุดจาก AWS มาแก้เฉพาะ tag ของ image
-      # ไม่ประกอบขึ้นใหม่จากไฟล์ใน repo เพราะ repo นี้ไม่ได้ถือ userdata.sh
-      # และวิธีนี้รักษาค่าอื่นที่ฝั่ง infra แก้ไว้เอาไว้ครบ
-      - name: Create a launch template version pointing at the new image
-        id: ltv
+      # 1. เปลี่ยนป้ายประกาศให้เป็นเวอร์ชันที่เพิ่ง push ขึ้น ECR
+      - name: Update the image tag in SSM
         run: |
-          account=$(aws sts get-caller-identity --query Account --output text)
-          image="$account.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY"
+          aws ssm put-parameter \
+            --name "$IMAGE_TAG_PARAM" \
+            --value "$TAG" \
+            --type String \
+            --overwrite >/dev/null
+          echo "✅ $IMAGE_TAG_PARAM = $TAG"
 
-          aws ec2 describe-launch-template-versions \
-            --launch-template-id "${{ steps.find.outputs.lt }}" --versions '$Latest' \
-            --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text \
-            | base64 -d > /tmp/userdata.sh
-
-          if ! grep -q "$image:" /tmp/userdata.sh; then
-            echo "::error::ไม่พบ $image ใน user data ของ launch template — ตรวจชื่อ ECR ให้ตรงกับ ec2.tf"
-            exit 1
-          fi
-          sed -i -E "s#($image):[A-Za-z0-9._-]+#\1:$TAG#g" /tmp/userdata.sh
-          base64 -w0 /tmp/userdata.sh > /tmp/userdata.b64
-
-          version=$(aws ec2 create-launch-template-version \
-            --launch-template-id "${{ steps.find.outputs.lt }}" \
-            --source-version '$Latest' \
-            --version-description "image $TAG" \
-            --launch-template-data "{\"UserData\":\"$(cat /tmp/userdata.b64)\"}" \
-            --query 'LaunchTemplateVersion.VersionNumber' --output text)
-
-          aws ec2 modify-launch-template \
-            --launch-template-id "${{ steps.find.outputs.lt }}" \
-            --default-version "$version" >/dev/null
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      # ASG ตั้ง instance_refresh triggers = ["tag"] ไว้ การเขียน tag ใหม่จึงเป็นสัญญาณ
-      # ให้มันทยอยเปลี่ยนเครื่องเอง (Rolling, min healthy 50%, warmup 180 วินาที)
-      # ไม่มีการลบเครื่องแล้วสร้างใหม่ทั้งชุด
-      - name: Trigger the rolling refresh
+      # 2. สะกิด ASG ให้ทยอยสลับเครื่อง เครื่องใหม่บูตมาอ่าน tag จาก SSM แล้ว pull ตัวนั้น
+      #    ไม่แตะ launch template และไม่มีคำสั่งลบหรือสร้างเครื่องในนี้เลย
+      - name: Trigger the rolling instance refresh
         run: |
-          aws autoscaling create-or-update-tags --tags \
-            "ResourceId=${{ steps.find.outputs.asg }},ResourceType=auto-scaling-group,Key=ImageTag,Value=$TAG,PropagateAtLaunch=true"
+          id=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ steps.find.outputs.asg }}" \
+            --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":180}' \
+            --query InstanceRefreshId --output text)
+          echo "✅ instance refresh $id เริ่มแล้ว"
 
       - name: Wait for the rollout
         run: |
@@ -333,7 +307,7 @@ jobs:
             pct=$(echo "$info" | awk '{print $2}')
             echo "  $status ${pct}%"
             case "$status" in
-              Successful) echo "เครื่องทุกตัวเปลี่ยนเป็น image ใหม่แล้ว"; exit 0 ;;
+              Successful) echo "เครื่องทุกตัวรัน image ใหม่แล้ว"; exit 0 ;;
               Failed|Cancelled) echo "::error::instance refresh $status"; exit 1 ;;
             esac
             sleep 30
@@ -347,9 +321,9 @@ jobs:
             echo "### Rollout"
             echo ""
             echo "- ASG: \`${{ steps.find.outputs.asg }}\`"
-            echo "- Launch template version: \`${{ steps.ltv.outputs.version }}\`"
-            echo "- Image: \`$ECR_REPOSITORY:$TAG\`"
+            echo "- SSM: \`$IMAGE_TAG_PARAM\` = \`$TAG\`"
             echo ""
-            echo "ASG ทยอยเปลี่ยนเครื่องเองแบบ rolling (min healthy 50%, warmup 180s)"
+            echo "ASG ทยอยสลับเครื่องเองแบบ rolling (min healthy 50%, warmup 180s)"
+            echo "เครื่องใหม่อ่าน tag จาก SSM ตอนบูตแล้ว docker pull ตัวนั้นมารัน"
             echo "ถ้าต้องย้อนกลับ ให้รัน **Launch Image** ที่ repo \`prodpai_cloud\` ด้วย tag เก่า"
           } >> "$GITHUB_STEP_SUMMARY"
