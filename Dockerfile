@@ -15,7 +15,7 @@ COPY js/        /usr/share/nginx/html/js/
 COPY assets/    /usr/share/nginx/html/assets/
 
 # Base image already runs as the non-root "nginx" user (uid 101).
-USER 101
+USER root
 
 EXPOSE 8080
 
